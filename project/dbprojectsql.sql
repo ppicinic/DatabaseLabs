@@ -3,7 +3,7 @@
 -- drop tables
 
 
-
+Drop TABLE IF EXISTS equipItems;
 DROP TABLE IF EXISTS classSkills;
 DROP TABLE IF EXISTS raceSkills;
 DROP TABLE IF EXISTS characterSkills;
@@ -183,6 +183,7 @@ CREATE TABLE equipments(
 	check(isProperType(glovesId, 'gloves')),
 	check(isProperType(weaponId, 'weapon'))
 );
+
 -- triggers
 
 CREATE OR REPLACE FUNCTION characterFill() RETURNS trigger AS $characterFill$
@@ -198,24 +199,75 @@ CREATE OR REPLACE FUNCTION characterFill() RETURNS trigger AS $characterFill$
 		LOOP
 			INSERT INTO characterSkills (characterId, skillId) VALUES (NEW.characterId, c);
 		END LOOP;
+		INSERT INTO inventories (characterId) VALUES (NEW.characterId);
+		INSERT INTO equipments (characterId) VALUES (NEW.characterId);
 		RETURN NULL;
 	END;
 $characterFill$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION skillFill() RETURNS trigger AS $sFill$
+	DECLARE
+		r integer;
+		c integer;
+	BEGIN
+		FOR r IN SELECT skillId FROM raceSkills WHERE raceId = NEW.raceId AND skillId NOT IN (SELECT skillId FROM characterSkills WHERE characterId = NEW.characterId)
+		LOOP
+			INSERT INTO characterSkills (characterId, skillId) VALUES (NEW.characterId, r);
+		END LOOP;
+		FOR c IN SELECT skillId FROM classSkills WHERE classId = NEW.classId AND skillId NOT IN (SELECT skillId FROM characterSkills WHERE characterId = NEW.characterId)
+		LOOP
+			INSERT INTO characterSkills (characterId, skillId) VALUES (NEW.characterId, c);
+		END LOOP;
+		RETURN NULL;
+	END;
+$sFill$ LANGUAGE plpgsql;
+
 CREATE TRIGGER characterFill
 AFTER INSERT ON characters FOR ROW EXECUTE PROCEDURE characterFill();
 
+CREATE TRIGGER classSkillUpdate
+AFTER UPDATE OF classId ON characters FOR ROW EXECUTE PROCEDURE skillFill();
+
+CREATE TRIGGER raceSkillUpdate
+AFTER UPDATE OF raceId ON characters FOR ROW EXECUTE PROCEDURE skillFill();
 -- views
 
-SELECT c.characterId, characterName, hi.name AS hat, wi.name AS weapon,
-	(coalesce(h.attack, 0) + coalesce(w.attack, 0)) AS totalAttack, (coalesce(h.defense, 0) + coalesce(w.defense, 0)) AS totalDefense
+CREATE OR REPLACE VIEW characterItemView AS 
+SELECT c.characterId, characterName, hi.name AS hat, si.name AS shirt, pi.name AS pants, shi.name AS shoes, gi.name AS gloves, wi.name AS weapon,
+	(coalesce(h.attack, 0) + coalesce(w.attack, 0) + coalesce(s.attack, 0) + coalesce(p.attack,0) + coalesce(sh.attack,0) 
+		+ coalesce(g.attack,0)) AS totalAttack, 
+	(coalesce(h.defense, 0) + coalesce(w.defense, 0) + coalesce(s.defense, 0) + coalesce(p.defense,0) + coalesce(sh.defense,0)
+		 + coalesce(g.defense,0)) AS totalDefense
 FROM characters AS c 
 	INNER JOIN equipments AS e ON c.characterId = e.characterId
 		LEFT JOIN equipItems AS h ON e.hatId = h.itemId
 			LEFT JOIN items AS hi ON h.itemId = hi.itemId
 		LEFT JOIN equipItems AS w On e.weaponId = w.itemId
 			LEFT JOIN items AS wi ON w.itemId = wi.itemId
+		LEFT JOIN equipItems  AS s ON e.shirtId = s.itemId
+			LEFT JOIN items AS si ON s.itemId = si.itemId
+		LEFT JOIN equipItems AS p ON e.pantsId = p.itemId
+			LEFT JOIN items AS pi ON p.itemId = pi.itemId
+		LEFT JOIN equipItems AS sh ON e.shoesId = sh.itemId
+			LEFT JOIN items AS shi ON sh.itemId = shi.itemId
+		LEFT JOIN equipItems AS g ON e.glovesId = g.itemId
+			LEFT JOIN items AS gi ON g.itemId = gi.itemId;
 
+CREATE OR REPLACE VIEW characterSkillView AS
+SELECT c.characterId, c.characterName, c.level, r.name AS race, cl.name AS class, s.name AS skill, cs.level AS skilllevel
+	FROM characters AS c
+	LEFT JOIN races AS r ON c.raceId = r.raceId
+	LEFT JOIN classes AS cl ON c.classId = cl.classId
+	LEFT JOIN characterSkills AS cs ON c.characterId = cs.characterId
+	LEFT JOIN skills AS s ON cs.skillId = s.skillId;
+
+CREATE OR REPLACE VIEW playerCharactersView AS
+SELECT p.playerId, email, username, characterName, level, r.name AS race, cl.name AS class, experience, 
+	maxhealth, maxmana, strength, intelligence, endurance, speed
+	FROM players AS p
+	LEFT JOIN characters AS c ON p.playerId = c.playerId
+	LEFT JOIN classes AS cl ON c.classId = cl.classId
+	LEFT JOIN races AS r ON c.raceId = r.raceId;
 -- server side initialization data
 
 INSERT INTO classes
@@ -471,8 +523,9 @@ INSERT INTO characters
 	VALUES
 	(1, 2, 3, 1, 'PixieMage', 0, 50, 200, 50, 200, 3, 7, 2, 30);
 
-UPDATE equipments SET glovesId = 3 WHERE characterId = 2;
+UPDATE equipments SET weaponId = (SELECT itemId FROM items WHERE name='Small Sword') WHERE characterId = 2;
 
+UPDATE characters SET classId = (SELECT classId FROM classes WHERE name='Priest') WHERE characterId = (SELECT characterId FROM characters WHERE characterName = 'PixieMage');
 
 -- testing sql
 
@@ -500,8 +553,7 @@ LEFT JOIN skills AS s ON rs.skillId = s.skillId
 ORDER BY r.raceId;
 
 -- get a character with all skills
-SELECT * FROM players AS p
-LEFT JOIN characters AS c ON p.playerId = c.playerId
+SELECT * FROM characters AS c 
 LEFT JOIN characterSkills AS cs ON c.characterId = cs.characterId
 LEFT JOIN skills AS s ON cs.skillId = s.skillId
 
