@@ -2,8 +2,14 @@
 
 -- drop tables
 
+DROP VIEW IF EXISTS characterItemView;
+DROP VIEW IF EXISTS characterSkillView;
+DROP VIEW IF EXISTS playerCharactersView;
 
-Drop TABLE IF EXISTS equipItems;
+DROP TABLE IF EXISTS equipments;
+DROP TABLE IF EXISTS equipItems;
+
+
 DROP TABLE IF EXISTS classSkills;
 DROP TABLE IF EXISTS raceSkills;
 DROP TABLE IF EXISTS characterSkills;
@@ -19,6 +25,10 @@ DROP TABLE IF EXISTS classes;
 DROP TABLE IF EXISTS skills;
 DROP TABLE IF EXISTS races;
 DROP TABLE IF EXISTS levels;
+
+DROP FUNCTION IF EXISTS isProperType(integer, equiptype);
+
+DROP TYPE IF EXISTS equiptype;
 
 -- create table
 
@@ -95,11 +105,24 @@ CREATE TABLE characters(
 	check(mana <= maxMana)
 );
 
+CREATE OR REPLACE FUNCTION checkSkillLevel(cid integer, sid integer, le integer) RETURNS boolean AS $res$
+DECLARE
+	maxL integer;
+BEGIN
+	maxL = (SELECT maxLevel FROM skills WHERE skillId = sid);
+	IF le > maxL THEN
+		RETURN FALSE;
+	END IF;
+	RETURN TRUE;
+END;
+$res$ LANGUAGE plpgsql;
+
 CREATE TABLE characterSkills(
 	characterId INTEGER NOT NULL REFERENCES characters(characterId),
 	skillId INTEGER NOT NULL REFERENCES skills(skillId),
 	level INTEGER NOT NULL DEFAULT 0,
-	PRIMARY KEY (characterId, skillId)
+	PRIMARY KEY (characterId, skillId),
+	check(checkSkillLevel(characterId, skillId, level))
 );
 
 CREATE TABLE inventories(
@@ -115,17 +138,17 @@ CREATE TABLE items(
 	PRIMARY KEY (itemId)
 );
 
-CREATE OR REPLACE FUNCTION isBeyondMax(id integer) RETURNS boolean AS $beyond$
+CREATE OR REPLACE FUNCTION isBeyondMax(id integer, iid integer) RETURNS boolean AS $beyond$
 DECLARE
 	amt integer;
 	maxCap integer;
 BEGIN
 	amt = (SELECT count(characterId) FROM inventoryContains WHERE characterId = id);
 	maxCap = (SELECT maxCapacity FROM inventories WHERE characterId = id);
-	IF amt >= maxCap THEN
-		RETURN FALSE;
-	ELSE
-		RETURN TRUE;
+	IF NOT EXISTS (SELECT itemId FROM inventoryContains WHERE characterId = id AND itemId = iid) THEN
+		IF amt >= maxCap THEN
+			RETURN FALSE;
+		END IF;
 	END IF;
 	RETURN TRUE;
 END
@@ -137,7 +160,7 @@ CREATE TABLE inventoryContains(
 	amount INTEGER NOT NULL DEFAULT 1,
 	PRIMARY KEY (characterId, itemId),
 
-	check(isBeyondMax(characterId))
+	check(isBeyondMax(characterId, itemId))
 );
 
 CREATE TYPE EQUIPTYPE as ENUM('hat', 'shirt', 'pants', 'shoes', 'gloves', 'weapon');
@@ -268,6 +291,89 @@ SELECT p.playerId, email, username, characterName, level, r.name AS race, cl.nam
 	LEFT JOIN characters AS c ON p.playerId = c.playerId
 	LEFT JOIN classes AS cl ON c.classId = cl.classId
 	LEFT JOIN races AS r ON c.raceId = r.raceId;
+
+-- stored procedures
+
+CREATE OR REPLACE FUNCTION addExp(expAmt integer, id integer) RETURNS void AS $$
+DECLARE
+	expNeeded int;
+	expHas int;
+	nextLevel int;
+	maxLevel int;
+	nextExp int;
+BEGIN
+	expNeeded = (SELECT totalExpNeeded FROM levels WHERE level = (SELECT level FROM characters WHERE characterId = id));
+	expHas = (SELECT experience FROM characters WHERE characterId = id);
+	IF expHas + expAmt >= expNeeded THEN
+		nextLevel = (SELECT level FROM characters WHERE characterId = id) + 1;
+		UPDATE characters SET level = nextLevel WHERE characterId = id;
+		UPDATE characters SET experience = 0 WHERE characterId = id;
+		maxLevel = (SELECT level FROM levels ORDER BY level DESC LIMIT 1);
+		IF nextLevel = maxLevel THEN
+			nextExp = (((SELECT totalExpNeeded FROM levels WHERE level = maxLevel) * 3) / 2);
+			INSERT INTO levels (totalExpNeeded) VALUES (nextExp);
+		END IF;
+		PERFORM addExp( ((expHas + expAmt) - expNeeded), id);
+	ELSE
+		UPDATE characters SET experience = (expHas + expAmt) WHERE characterId = id;
+	END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION affectHealth(hpAmt integer, id integer) RETURNS void AS $$
+DECLARE
+	maxHp int;
+	currHealth int;
+BEGIN
+	maxHp = (SELECT maxHealth FROM characters WHERE characterId = id);
+	currHealth = (SELECT health FROM characters WHERE characterId = id);
+	IF currHealth + hpAmt > maxHp THEN
+		UPDATE characters SET health = maxHp WHERE characterId = id;
+	ELSIF currHealth + hpAmt <= 0 THEN
+		UPDATE characters SET health = 0 WHERE characterId = id;
+	ELSE
+		UPDATE characters SET health = (currHealth + hpAmt) WHERE characterId = id;
+	END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION affectMana(manaAmt integer, id integer) RETURNS void AS $$
+DECLARE
+	maxMn int;
+	currMana int;
+BEGIN
+	maxMn = (SELECT maxMana FROM characters WHERE characterId = id);
+	currMana = (SELECT mana FROM characters WHERE characterId = id);
+	IF currMana + manaAmt > maxMn THEN
+		UPDATE characters SET mana = maxMn WHERE characterId = id;
+	ELSIF currMana + manaAmt <= 0 THEN
+		UPDATE characters SET mana = 0 WHERE characterId = id;
+	ELSE
+		UPDATE characters SET mana = (currMana + manaAmt) WHERE characterId = id;
+	END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- users
+CREATE USER sysadmin WITH PASSWORD 'alpaca';
+CREATE USER application WITH PASSWORD 'alpaca';
+
+-- permissions (grant / revoke)
+
+REVOKE ALL PRIVILEGES ON characters FROM sysadmin;
+REVOKE ALL PRIVILEGES ON classes FROM sysadmin;
+REVOKE ALL PRIVILEGES ON races FROM sysadmin;
+REVOKE ALL PRIVILEGES ON characterSkills FROM sysadmin;
+REVOKE ALL PRIVILEGES ON skills FROM sysadmin;
+REVOKE ALL PRIVILEGES ON classSkills FROM sysadmin;
+REVOKE ALL PRIVILEGES ON raceSkills FROM sysadmin;
+REVOKE ALL PRIVILEGES ON equipments FROM sysadmin;
+REVOKE ALL PRIVILEGES ON inventories FROM sysadmin;
+REVOKE ALL PRIVILEGES ON levels FROM sysadmin;
+REVOKE ALL PRIVILEGES ON inventoryContains FROM sysadmin;
+REVOKE ALL PRIVILEGES ON items FROM sysadmin;
+REVOKE ALL PRIVILEGES ON equipItems FROM sysadmin;
+
 -- server side initialization data
 
 INSERT INTO classes
@@ -496,11 +602,80 @@ INSERT INTO items
 	VALUES
 	('Small Sword', 'A basic sword with low attack power');
 
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Large Sword', 'A long sword with high attack power');
+
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Blue Hat', 'a blue fancy hat');
+
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Blue Pants', 'Fancy Blue Pants');
+
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Blue Shirt', 'Fancy blue shirt');
+
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Red Shirt', 'Tough Red Shirt');
+
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Hiking boots', 'Boots made for walking');
+
+INSERT INTO items
+	(name, description)
+	VALUES
+	('Spiked Gloves', 'Gloves covered in lethal spikes');
+
 INSERT INTO equipItems
 	(itemId, type, attack, defense)
 	VALUES
 	((SELECT itemId FROM items WHERE name = 'Small Sword'), 'weapon', 10, 0);
 
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(4, 'weapon', 30, 0);
+
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(5, 'hat', 0, 5);
+
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(6, 'pants', 0, 10);
+
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(7, 'shirt', 0, 10);
+
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(8, 'shirt', 00, 20);
+
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(9, 'shoes', 0, 8);
+
+INSERT INTO equipItems
+	(itemId, type, attack, defense)
+	VALUES
+	(10, 'gloves', 6, 4);
 -- test data
 
 INSERT INTO players 
@@ -523,12 +698,56 @@ INSERT INTO characters
 	VALUES
 	(1, 2, 3, 1, 'PixieMage', 0, 50, 200, 50, 200, 3, 7, 2, 30);
 
-UPDATE equipments SET weaponId = (SELECT itemId FROM items WHERE name='Small Sword') WHERE characterId = 2;
+INSERT INTO characters
+	(playerId, raceId, classId, level, characterName, experience, maxHealth, maxMana, health, mana, strength, intelligence, endurance, speed)
+	VALUES
+	(2, 3, 4, 5, 'JamesBond', 10, 500, 350, 400, 42, 37, 52, 28, 22);
 
-UPDATE characters SET classId = (SELECT classId FROM classes WHERE name='Priest') WHERE characterId = (SELECT characterId FROM characters WHERE characterName = 'PixieMage');
+UPDATE equipments SET weaponId = (SELECT itemId FROM items WHERE name='Small Sword') WHERE characterId = 2;
+UPDATE equipments SET hatId = 5 WHERE characterId = 2;
+UPDATE equipments SET pantsId = 6 WHERE characterId = 2;
+UPDATE equipments SET shirtId = 8 WHERE characterId = 2;
+UPDATE equipments SET shoesId = 9 WHERE characterId = 2;
+
+UPDATE equipments SET weaponId = 4 WHERE characterId = 3;
+UPDATE equipments SET pantsId = 6 WHERE characterId = 3;
+UPDATE equipments SET shirtId = 7 WHERE characterId = 3;
+UPDATE equipments SET glovesId = 10 WHERE characterId = 3;
+
+UPDATE characters SET classId = (SELECT classId FROM classes WHERE name='Priest') WHERE characterId = 2;
+
+UPDATE characterSkills SET level = 20 WHERE characterId = 2 AND skillId = 9;
+
+UPDATE characters SET health = 10 WHERE characterId = 2;
+
+UPDATE inventories SET maxCapacity = 1 WHERE characterId = 1;
+
+INSERT INTO inventoryContains VALUES (2,1,25);
+INSERT INTO inventoryContains VALUES (2,2,25);
+INSERT INTO inventoryContains VALUES (3,2,100);
+
+-- reports 
+
+SELECT c.characterName, r.name AS race, s.name AS skill, cs.level
+FROM characters AS c
+INNER JOIN races AS r ON c.raceId = r.raceId
+INNER JOIN raceSkills AS rs ON r.raceId = rs.raceId
+INNER JOIN skills AS s ON rs.skillId = s.skillId
+INNER JOIN characterSkills AS cs ON cs.characterId = c.characterId AND cs.skillId = s.skillId;
+
+SELECT c.characterName, cl.name AS class, s.name AS skill, cs.level
+FROM characters AS c
+INNER JOIN classes AS cl ON c.classId = cl.classId
+INNER JOIN classSkills AS cls ON cl.classId = cls.classId
+INNER JOIN skills AS s ON cls.skillId = s.skillId
+INNER JOIN characterSkills AS cs ON cs.characterId = c.characterId AND cs.skillId = s.skillId;
+
+SELECT i.itemid, i.name, i.description, e.type, e.attack, e.defense
+FROM equipItems AS e
+INNER JOIN items AS i ON e.itemId = i.itemId;
 
 -- testing sql
-
+select * from char
 select * from players;
 select * from classes;
 select * from characters;
@@ -537,8 +756,14 @@ select * from skills;
 select * from races;
 select * from levels;
 select * from inventories;
+select * from inventoryContains;
 select * from items;
 select * from equipItems AS e INNER JOIN items AS i ON e.itemId = i.itemId;
+
+-- view test
+select * from characterItemView;
+select * from characterSkillView;
+select * from playerCharactersView;
 
 -- get a character with all skills
 select * from classes AS c
